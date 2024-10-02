@@ -23,7 +23,7 @@ RUN python3 -m pip install --upgrade pip
 RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 # Set the working directory
-WORKDIR /llama2
+WORKDIR /app
 
 # Set the entrypoint
 ENTRYPOINT [ "python3" ]

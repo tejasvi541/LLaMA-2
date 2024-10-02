@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - ./:/llama2 # Bind mount the current directory to the /llama2 directory in the container
+      - ./:/app # Bind mount the current directory to the /llama2 directory in the container
     environment:
       - NVIDIA_VISIBLE_DEVICES=all # Allow access to all GPUs
     runtime: nvidia # GPU runtime
