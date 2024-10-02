@@ -9,3 +9,4 @@ tensorboard==2.13.0
 altair==5.1.1
 wandb==0.15.9
 sentencepiece
+llama-stack
