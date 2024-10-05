@@ -63,6 +63,49 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
     x_out = x_out.reshape(*x.shape)
     return x_out.type_as(x).to(device)
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # The gamma parameter
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor):
+        # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
+        # rsqrt: 1 / sqrt(x)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor):
+        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
+        return self.weight * self._norm(x.float()).type_as(x)
+    
+
+class EncoderBlock(nn.Module):
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+
+        self.attention = SelfAttention(args)
+        self.feed_forward = FeedForward(args)
+
+        # Normalization BEFORE the attention block
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        # Normalization BEFORE the feed forward block
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+        # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_complex
+        )
+        # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
+        return out
+
 # Main model class
 class Transformer(nn.Module):
     def __init__(self, args:ModelArgs)-> None:
