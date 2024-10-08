@@ -1,27 +1,45 @@
+from dataclasses import dataclass
+from typing import Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from dataclasses import dataclass
-from typing import Optional
 
-# This class defines the Model Parameters
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
-    n_heads: int = 32 # Number of heads for the queries
-    n_kv_head: Optional[int] = None # Number of heads for the keys and values
-    vocab_size: int = -1 # This will be set when we load the tokenizer
-    multiple_of: int = 256 # Hidden Dimension of the feedforward network
-    ff_dim_multipier: Optional[int] = None # Multiplier for the feedforward network
-    norm_eps: float = 1e-6 # Epsilon value for the layer normalization
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1 # Later set in the build method
+    multiple_of: int = 256
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
 
-    # needed for kv cache
-    max_seq_len: int = 2048 # Maximum sequence length
+    # Needed for KV cache
     max_batch_size: int = 32
+    max_seq_len: int = 2048
 
     device: str = None
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        # The gamma parameter
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x: torch.Tensor):
+        # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
+        # rsqrt: 1 / sqrt(x)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor):
+        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
+        return self.weight * self._norm(x.float()).type_as(x)
+
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     # As written in the paragraph 3.2.2 of the paper
@@ -62,6 +80,21 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor, device
     # (B, Seq_Len, H, Head_Dim/2, 2) -> (B, Seq_Len, H, Head_Dim)
     x_out = x_out.reshape(*x.shape)
     return x_out.type_as(x).to(device)
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch_size, seq_len, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        # (B, Seq_Len, N_KV_Heads, 1, Head_Dim)
+        x[:, :, :, None, :]
+        # (B, Seq_Len, N_KV_Heads, N_Rep, Head_Dim)
+        .expand(batch_size, seq_len, n_kv_heads, n_rep, head_dim)
+        # (B, Seq_Len, N_KV_Heads * N_Rep, Head_Dim)
+        .reshape(batch_size, seq_len, n_kv_heads * n_rep, head_dim)
+    )
+
 
 class SelfAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -145,22 +178,36 @@ class SelfAttention(nn.Module):
         output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
         return self.wo(output) # (B, 1, Dim) -> (B, 1, Dim)
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        # The gamma parameter
-        self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor):
-        # (B, Seq_Len, Dim) * (B, Seq_Len, 1) = (B, Seq_Len, Dim)
-        # rsqrt: 1 / sqrt(x)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        args: ModelArgs
+    ):
+        super().__init__()
+
+        hidden_dim = 4 * args.dim
+        hidden_dim = int(2 * hidden_dim / 3)
+        if args.ffn_dim_multiplier is not None:
+            hidden_dim = int(args.ffn_dim_multiplier * hidden_dim)
+        # Round the hidden_dim to the nearest multiple of the multiple_of parameter
+        hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
+
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor):
-        # (Dim) * (B, Seq_Len, Dim) = (B, Seq_Len, Dim)
-        return self.weight * self._norm(x.float()).type_as(x)
-    
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
+        swish = F.silu(self.w1(x))
+        # (B, Seq_Len, Dim) --> (B, Seq_Len, Hidden_Dim)
+        x_V = self.w3(x)
+        # (B, Seq_Len, Hidden_Dim) * (B, Seq_Len, Hidden_Dim) --> (B, Seq_Len, Hidden_Dim)
+        x = swish * x_V
+        # (B, Seq_Len, Hidden_Dim) --> (B, Seq_Len, Dim)
+        x = self.w2(x)
+        return x
+
 
 class EncoderBlock(nn.Module):
 
@@ -187,13 +234,13 @@ class EncoderBlock(nn.Module):
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
-
-# Main model class
+    
 class Transformer(nn.Module):
-    def __init__(self, args:ModelArgs)-> None:
+
+    def __init__(self, args: ModelArgs):
         super().__init__()
 
-        assert args.vocab_size != -1, "Please pass the vocab size"
+        assert args.vocab_size != -1, "Vocab size must be set"
 
         self.args = args
         self.vocab_size = args.vocab_size
@@ -201,30 +248,28 @@ class Transformer(nn.Module):
         self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
 
         self.layers = nn.ModuleList()
-        for _ in range(self.n_layers):
+        for layer_id in range(args.n_layers):
             self.layers.append(EncoderBlock(args))
-        
-        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
 
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, self.vocab_size, bias=False)
 
-        self.freq_complex = precompute_theta_pos_frequencies(self.args.dim//self.args.n_heads, self.args.max_seq_len*2, device=self.args.device)
-    
-    def forward(self, tokens:torch.Tensor, start_pos:int):
-        # (B, seq_len) -> (B, seq_len, dim)
-        batch_size, seq_len = tokens.size()
-        assert seq_len == 1, "This model only supports autoregressive generation not training as we are using llama 2 7B weights"
+        self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
 
-        h = self.tok_embeddings(tokens) # (B, seq_len, dim)
+    def forward(self, tokens: torch.Tensor, start_pos: int):
+        # (B, Seq_Len)
+        batch_size, seq_len = tokens.shape
+        assert seq_len == 1, "Only one token at a time can be processed"
 
-        # retrieve the pair(m, theta) corresponding to the positions [start_pos, start_pos+seq_len]
-        freq_complex = self.freq_complex[start_pos:start_pos+seq_len]
+        # (B, Seq_Len) -> (B, Seq_Len, Dim)
+        h = self.tok_embeddings(tokens)
 
-        # Consecutively apply the encoder blocks
-
+        # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
+        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        
+        # Consecutively apply all the encoder layers
         for layer in self.layers:
-            h = layer(h, start_pos,freq_complex)
+            h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
         output = self.output(h).float()
         return output
-
